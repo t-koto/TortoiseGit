@@ -671,9 +671,24 @@ CDiffData::DoTwoWayDiff(const CString& sBaseFilename, const CString& sYourFilena
 	return true;
 }
 
+static void PickBlock(std::vector<char>& bytes, CUtf8Filter& filter, CFileTextLines& lines, int base, int length)
+{
+	for (int i = 0; i < length; i++)
+	{
+		const CBuffer& buffer = filter.Encode(lines.GetAt(base + i));
+		int pos = bytes.size();
+		bytes.resize(pos + buffer.GetLength() + 1);
+		memcpy(&bytes[pos], buffer, buffer.GetLength());
+		pos += buffer.GetLength();
+		bytes[pos++] = '\n';
+	}
+}
+
 bool
 CDiffData::DoThreeWayDiff(const CString& sBaseFilename, const CString& sYourFilename, const CString& sTheirFilename, DWORD dwIgnoreWS, bool bIgnoreEOL, bool bIgnoreCase, bool bIgnoreComments, apr_pool_t* pool)
 {
+	bool useConflictDiffImprovement = !!CRegDWORD(L"Software\\TortoiseGit\\UseConflictDiffImprovement", TRUE);
+
 	// the following three arrays are used to check for conflicts even in case the
 	// user has ignored spaces/eols.
 	CStdDWORDArray              m_arDiff3LinesBase;
@@ -763,139 +778,243 @@ CDiffData::DoThreeWayDiff(const CString& sBaseFilename, const CString& sYourFile
 		}
 		else if (tempdiff->type == svn_diff__type_conflict)
 		{
-			apr_off_t length = max(tempdiff->original_length, tempdiff->modified_length);
-			length = max(tempdiff->latest_length, length);
-			apr_off_t original = tempdiff->original_length;
-			apr_off_t modified = tempdiff->modified_length;
-			apr_off_t latest = tempdiff->latest_length;
-
-			apr_off_t originalresolved = 0;
-			apr_off_t modifiedresolved = 0;
-			apr_off_t latestresolved = 0;
-
-			LONG base = baseline;
-			LONG your = yourline;
-			LONG their = theirline;
-			if (tempdiff->resolved_diff)
+			if (useConflictDiffImprovement)
 			{
-				originalresolved = tempdiff->resolved_diff->original_length;
-				modifiedresolved = tempdiff->resolved_diff->modified_length;
-				latestresolved = tempdiff->resolved_diff->latest_length;
-			}
-			for (int i=0; i<length; i++)
-			{
-				EOL endingBase = m_arBaseFile.GetCount() > baseline ? m_arBaseFile.GetLineEnding(baseline) : EOL_AUTOLINE;
-				if (original)
+				svn_diff_t* diffYourBase = nullptr;
+				svn_diff_t* diffTheirBase = nullptr;
 				{
-					if (m_arBaseFile.GetCount() > baseline)
+					CUtf8Filter filter(nullptr);
+					std::vector<char> original;
+					std::vector<char> latest;
+					std::vector<char> modified;
+					PickBlock(original, filter, m_arBaseFile, baseline, tempdiff->original_length);
+					PickBlock(latest, filter, m_arYourFile, yourline, tempdiff->latest_length);
+					PickBlock(modified, filter, m_arTheirFile, theirline, tempdiff->modified_length);
+					svn_string_t original_string = { original.data(), original.size() };
+					svn_string_t latest_string = { latest.data(), latest.size() };
+					svn_string_t modified_string = { modified.data(), modified.size() };
+
+					svnerr = svn_diff_mem_string_diff(&diffYourBase, &original_string, &latest_string, options, pool);
+					if (svnerr)
+						return HandleSvnError(svnerr);
+
+					svnerr = svn_diff_mem_string_diff(&diffTheirBase, &original_string, &modified_string, options, pool);
+					if (svnerr)
+						return HandleSvnError(svnerr);
+				}
+
+				apr_off_t original = tempdiff->original_length;
+				while (original)
+				{
+					AddLines(baseline, yourline, theirline);
+
+					if (diffYourBase->type == svn_diff__type_common)
+					{
+						m_YourBaseBoth.AddData(m_arYourFile.GetAt(yourline), DIFFSTATE_NORMAL, yourline, m_arYourFile.GetLineEnding(yourline), HIDESTATE_HIDDEN, -1);
+						yourline++;
+					}
+					else
+					{
+						m_YourBaseBoth.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_REMOVED, DIFF_EMPTYLINENUMBER, m_arBaseFile.GetLineEnding(baseline), HIDESTATE_SHOWN, -1);
+					}
+					if (diffTheirBase->type == svn_diff__type_common)
+					{
+						m_TheirBaseBoth.AddData(m_arTheirFile.GetAt(theirline), DIFFSTATE_NORMAL, theirline, m_arTheirFile.GetLineEnding(theirline), HIDESTATE_HIDDEN, -1);
+						theirline++;
+					}
+					else
+					{
+						m_TheirBaseBoth.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_REMOVED, DIFF_EMPTYLINENUMBER, m_arBaseFile.GetLineEnding(baseline), HIDESTATE_SHOWN, -1);
+					}
+					baseline++;
+					m_Diff3.AddData(L"", DIFFSTATE_CONFLICTED, resline, EOL_NOENDING, HIDESTATE_SHOWN, -1);
+					resline++;
+
+					original--;
+					diffYourBase->original_length--;
+					diffTheirBase->original_length--;
+					apr_off_t latest = 0;
+					apr_off_t modified = 0;
+					if (diffYourBase->original_length == 0 && diffYourBase->type == svn_diff__type_diff_modified)
+					{
+						latest = diffYourBase->modified_length;
+					}
+					if (diffTheirBase->original_length == 0 && diffTheirBase->type == svn_diff__type_diff_modified)
+					{
+						modified = diffTheirBase->modified_length;
+					}
+					while (latest || modified)
+					{
+						AddLines(baseline, yourline, theirline);
+						if (latest)
+						{
+							m_YourBaseBoth.AddData(m_arYourFile.GetAt(yourline), DIFFSTATE_ADDED, yourline, m_arYourFile.GetLineEnding(yourline), HIDESTATE_HIDDEN, -1);
+							yourline++;
+							latest--;
+						}
+						else
+						{
+							m_YourBaseBoth.AddData(emptyConflictEmpty);
+						}
+						if (modified)
+						{
+							m_TheirBaseBoth.AddData(m_arTheirFile.GetAt(theirline), DIFFSTATE_ADDED, theirline, m_arTheirFile.GetLineEnding(theirline), HIDESTATE_HIDDEN, -1);
+							theirline++;
+							modified--;
+						}
+						else
+						{
+							m_TheirBaseBoth.AddData(emptyConflictEmpty);
+						}
+						m_Diff3.AddData(L"", DIFFSTATE_CONFLICTED, resline, EOL_NOENDING, HIDESTATE_SHOWN, -1);
+						resline++;
+					}
+					if (diffYourBase->original_length == 0)
+					{
+						diffYourBase = diffYourBase->next;
+					}
+					if (diffTheirBase->original_length == 0)
+					{
+						diffTheirBase = diffTheirBase->next;
+					}
+				}
+			}
+			else
+			{
+				apr_off_t length = max(tempdiff->original_length, tempdiff->modified_length);
+				length = max(tempdiff->latest_length, length);
+				apr_off_t original = tempdiff->original_length;
+				apr_off_t modified = tempdiff->modified_length;
+				apr_off_t latest = tempdiff->latest_length;
+
+				apr_off_t originalresolved = 0;
+				apr_off_t modifiedresolved = 0;
+				apr_off_t latestresolved = 0;
+
+				LONG base = baseline;
+				LONG your = yourline;
+				LONG their = theirline;
+				if (tempdiff->resolved_diff)
+				{
+					originalresolved = tempdiff->resolved_diff->original_length;
+					modifiedresolved = tempdiff->resolved_diff->modified_length;
+					latestresolved = tempdiff->resolved_diff->latest_length;
+				}
+				for (int i=0; i<length; i++)
+				{
+					EOL endingBase = m_arBaseFile.GetCount() > baseline ? m_arBaseFile.GetLineEnding(baseline) : EOL_AUTOLINE;
+					if (original)
+					{
+						if (m_arBaseFile.GetCount() > baseline)
+						{
+							AddLines(baseline, yourline, theirline);
+
+							m_Diff3.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_IDENTICALREMOVED, DIFF_EMPTYLINENUMBER, endingBase , HIDESTATE_SHOWN, -1);
+							m_YourBaseBoth.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_IDENTICALREMOVED, DIFF_EMPTYLINENUMBER, endingBase , HIDESTATE_SHOWN, -1);
+							m_TheirBaseBoth.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_IDENTICALREMOVED, DIFF_EMPTYLINENUMBER, endingBase , HIDESTATE_SHOWN, -1);
+						}
+					}
+					else if ((originalresolved)||((modifiedresolved)&&(latestresolved)))
 					{
 						AddLines(baseline, yourline, theirline);
 
-						m_Diff3.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_IDENTICALREMOVED, DIFF_EMPTYLINENUMBER, endingBase , HIDESTATE_SHOWN, -1);
-						m_YourBaseBoth.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_IDENTICALREMOVED, DIFF_EMPTYLINENUMBER, endingBase , HIDESTATE_SHOWN, -1);
-						m_TheirBaseBoth.AddData(m_arBaseFile.GetAt(baseline), DIFFSTATE_IDENTICALREMOVED, DIFF_EMPTYLINENUMBER, endingBase , HIDESTATE_SHOWN, -1);
+						m_Diff3.AddData(emptyIdenticalRemoved);
+						if ((latestresolved)&&(modifiedresolved))
+						{
+							m_YourBaseBoth.AddData(emptyIdenticalRemoved);
+							m_TheirBaseBoth.AddData(emptyIdenticalRemoved);
+						}
 					}
-				}
-				else if ((originalresolved)||((modifiedresolved)&&(latestresolved)))
-				{
-					AddLines(baseline, yourline, theirline);
-
-					m_Diff3.AddData(emptyIdenticalRemoved);
-					if ((latestresolved)&&(modifiedresolved))
+					if (original)
 					{
-						m_YourBaseBoth.AddData(emptyIdenticalRemoved);
-						m_TheirBaseBoth.AddData(emptyIdenticalRemoved);
+						original--;
+						baseline++;
 					}
-				}
-				if (original)
-				{
-					original--;
-					baseline++;
-				}
-				if (originalresolved)
-					originalresolved--;
+					if (originalresolved)
+						originalresolved--;
 
-				if (modified)
-				{
-					modified--;
-					theirline++;
-				}
-				if (modifiedresolved)
-					modifiedresolved--;
-				if (latest)
-				{
-					latest--;
-					yourline++;
-				}
-				if (latestresolved)
-					latestresolved--;
-			}
-			original = tempdiff->original_length;
-			modified = tempdiff->modified_length;
-			latest = tempdiff->latest_length;
-			baseline = base;
-			yourline = your;
-			theirline = their;
-			if (tempdiff->resolved_diff)
-			{
-				originalresolved = tempdiff->resolved_diff->original_length;
-				modifiedresolved = tempdiff->resolved_diff->modified_length;
-				latestresolved = tempdiff->resolved_diff->latest_length;
-			}
-			for (int i=0; i<length; i++)
-			{
-				if ((latest)||(modified))
-				{
-					AddLines(baseline, yourline, theirline);
-
-					m_Diff3.AddData(L"", DIFFSTATE_CONFLICTED, resline, EOL_NOENDING, HIDESTATE_SHOWN, -1);
-
-					resline++;
-				}
-
-				if (latest)
-				{
-					if (m_arYourFile.GetCount() > yourline)
+					if (modified)
 					{
-						m_YourBaseBoth.AddData(m_arYourFile.GetAt(yourline), DIFFSTATE_CONFLICTADDED, yourline, m_arYourFile.GetLineEnding(yourline), HIDESTATE_SHOWN, -1);
+						modified--;
+						theirline++;
 					}
-				}
-				else if ((latestresolved)||(modified)||(modifiedresolved))
-				{
-					m_YourBaseBoth.AddData(emptyConflictEmpty);
-				}
-				if (modified)
-				{
-					if (m_arTheirFile.GetCount() > theirline)
+					if (modifiedresolved)
+						modifiedresolved--;
+					if (latest)
 					{
-						m_TheirBaseBoth.AddData(m_arTheirFile.GetAt(theirline), DIFFSTATE_CONFLICTADDED, theirline, m_arTheirFile.GetLineEnding(theirline), HIDESTATE_SHOWN, -1);
+						latest--;
+						yourline++;
 					}
+					if (latestresolved)
+						latestresolved--;
 				}
-				else if ((modifiedresolved)||(latest)||(latestresolved))
+				original = tempdiff->original_length;
+				modified = tempdiff->modified_length;
+				latest = tempdiff->latest_length;
+				baseline = base;
+				yourline = your;
+				theirline = their;
+				if (tempdiff->resolved_diff)
 				{
-					m_TheirBaseBoth.AddData(emptyConflictEmpty);
+					originalresolved = tempdiff->resolved_diff->original_length;
+					modifiedresolved = tempdiff->resolved_diff->modified_length;
+					latestresolved = tempdiff->resolved_diff->latest_length;
 				}
-				if (original)
+				for (int i=0; i<length; i++)
 				{
-					original--;
-					baseline++;
+					if ((latest)||(modified))
+					{
+						AddLines(baseline, yourline, theirline);
+
+						m_Diff3.AddData(L"", DIFFSTATE_CONFLICTED, resline, EOL_NOENDING, HIDESTATE_SHOWN, -1);
+
+						resline++;
+					}
+
+					if (latest)
+					{
+						if (m_arYourFile.GetCount() > yourline)
+						{
+							m_YourBaseBoth.AddData(m_arYourFile.GetAt(yourline), DIFFSTATE_CONFLICTADDED, yourline, m_arYourFile.GetLineEnding(yourline), HIDESTATE_SHOWN, -1);
+						}
+					}
+					else if ((latestresolved)||(modified)||(modifiedresolved))
+					{
+						m_YourBaseBoth.AddData(emptyConflictEmpty);
+					}
+					if (modified)
+					{
+						if (m_arTheirFile.GetCount() > theirline)
+						{
+							m_TheirBaseBoth.AddData(m_arTheirFile.GetAt(theirline), DIFFSTATE_CONFLICTADDED, theirline, m_arTheirFile.GetLineEnding(theirline), HIDESTATE_SHOWN, -1);
+						}
+					}
+					else if ((modifiedresolved)||(latest)||(latestresolved))
+					{
+						m_TheirBaseBoth.AddData(emptyConflictEmpty);
+					}
+					if (original)
+					{
+						original--;
+						baseline++;
+					}
+					if (originalresolved)
+						originalresolved--;
+					if (modified)
+					{
+						modified--;
+						theirline++;
+					}
+					if (modifiedresolved)
+						modifiedresolved--;
+					if (latest)
+					{
+						latest--;
+						yourline++;
+					}
+					if (latestresolved)
+						latestresolved--;
 				}
-				if (originalresolved)
-					originalresolved--;
-				if (modified)
-				{
-					modified--;
-					theirline++;
-				}
-				if (modifiedresolved)
-					modifiedresolved--;
-				if (latest)
-				{
-					latest--;
-					yourline++;
-				}
-				if (latestresolved)
-					latestresolved--;
 			}
 		}
 		else if (tempdiff->type == svn_diff__type_diff_modified)
