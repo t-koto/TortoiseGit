@@ -846,6 +846,7 @@ CDiffData::DoThreeWayDiff(const CString& sBaseFilename, const CString& sYourFile
 							if (latest)
 							{
 								m_YourBaseBoth.AddData(m_arYourFile.GetAt(yourline), DIFFSTATE_CONFLICTADDED, yourline, m_arYourFile.GetLineEnding(yourline), HIDESTATE_SHOWN, -1);
+								yourline++;
 								latest--;
 							}
 							else
@@ -855,6 +856,7 @@ CDiffData::DoThreeWayDiff(const CString& sBaseFilename, const CString& sYourFile
 							if (modified)
 							{
 								m_TheirBaseBoth.AddData(m_arTheirFile.GetAt(theirline), DIFFSTATE_CONFLICTADDED, theirline, m_arTheirFile.GetLineEnding(theirline), HIDESTATE_SHOWN, -1);
+								theirline++;
 								modified--;
 							}
 							else
@@ -862,8 +864,6 @@ CDiffData::DoThreeWayDiff(const CString& sBaseFilename, const CString& sYourFile
 								m_TheirBaseBoth.AddData(emptyConflictEmpty);
 							}
 							m_Diff3.AddData(L"", DIFFSTATE_CONFLICTED, resline, EOL_NOENDING, HIDESTATE_SHOWN, -1);
-							yourline++;
-							theirline++;
 							resline++;
 						}
 						else
